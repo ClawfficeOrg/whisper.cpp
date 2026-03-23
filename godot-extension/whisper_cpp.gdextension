@@ -1,0 +1,11 @@
+[configuration]
+entry_symbol = "whisper_cpp_gdext_init"
+compatibility_minimum = "4.6"
+
+[libraries]
+linux.debug.x86_64   = "res://addons/whisper_cpp/bin/libwhisper_cpp_gdext.linux.debug.x86_64.so"
+linux.release.x86_64 = "res://addons/whisper_cpp/bin/libwhisper_cpp_gdext.linux.release.x86_64.so"
+windows.debug.x86_64   = "res://addons/whisper_cpp/bin/whisper_cpp_gdext.windows.debug.x86_64.dll"
+windows.release.x86_64 = "res://addons/whisper_cpp/bin/whisper_cpp_gdext.windows.release.x86_64.dll"
+macos.debug   = "res://addons/whisper_cpp/bin/libwhisper_cpp_gdext.macos.debug.framework"
+macos.release = "res://addons/whisper_cpp/bin/libwhisper_cpp_gdext.macos.release.framework"

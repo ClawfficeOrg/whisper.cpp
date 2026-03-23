@@ -1,0 +1,17 @@
+[package]
+name = "whisper_cpp_gdext"
+version = "0.1.0"
+edition = "2021"
+description = "GDExtension bindings for whisper.cpp — exposes WhisperCpp node to Godot 4"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+godot = "0.4"
+whisper-rs = "0.16"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
