@@ -1,26 +1,7 @@
 //! WhisperCpp — Godot Node wrapping whisper-rs for speech recognition.
-//!
-//! ## Usage (GDScript)
-//! ```gdscript
-//! @onready var whisper: WhisperCpp = $WhisperCpp
-//!
-//! func _ready():
-//!     whisper.transcription_complete.connect(_on_transcription)
-//!     whisper.transcription_error.connect(_on_error)
-//!     whisper.load_model("user://models/ggml-base.en.bin")
-//!
-//! func record_done(audio: PackedByteArray):
-//!     whisper.transcribe(audio)
-//!
-//! func _on_transcription(text: String):
-//!     print("Got:", text)
-//!
-//! func _on_error(msg: String):
-//!     push_error(msg)
-//! ```
 
 use godot::prelude::*;
-use godot::classes::Node;
+use godot::classes::{Node, INode};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
@@ -29,22 +10,22 @@ use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingS
 ///
 /// Signals
 /// -------
-/// * `transcription_complete(text: String)` — emitted on the main thread when
-///   transcription finishes successfully.
-/// * `transcription_error(msg: String)` — emitted on the main thread when an
-///   error occurs during loading or transcription.
+/// * `transcription_complete(text: String)` — emitted when transcription finishes.
+/// * `transcription_error(msg: String)` — emitted when an error occurs.
 /// * `model_loaded(path: String)` — emitted after the model is ready.
 #[derive(GodotClass)]
 #[class(base = Node)]
 pub struct WhisperCpp {
     base: Base<Node>,
 
-    /// Shared whisper context, protected by a mutex so the background thread
-    /// and the main thread can both access it safely.
+    /// Shared whisper context.
     context: Arc<Mutex<Option<WhisperContext>>>,
 
     /// Whether a transcription job is currently running.
     is_transcribing: bool,
+
+    /// Shared result slot — background thread writes here, _process polls it.
+    pending_result: Arc<Mutex<Option<Result<String, String>>>>,
 
     /// Transcription language (BCP-47 code, e.g. "en").
     #[var]
@@ -63,8 +44,33 @@ impl INode for WhisperCpp {
             base,
             context: Arc::new(Mutex::new(None)),
             is_transcribing: false,
+            pending_result: Arc::new(Mutex::new(None)),
             language: GString::from("en"),
             threads: 4,
+        }
+    }
+
+    fn process(&mut self, _delta: f64) {
+        let result = {
+            let mut guard = self.pending_result.lock().unwrap();
+            guard.take()
+        };
+        if let Some(outcome) = result {
+            self.is_transcribing = false;
+            match outcome {
+                Ok(text) => {
+                    self.base_mut().emit_signal(
+                        "transcription_complete",
+                        &[GString::from(text.as_str()).to_variant()],
+                    );
+                }
+                Err(msg) => {
+                    self.base_mut().emit_signal(
+                        "transcription_error",
+                        &[GString::from(msg.as_str()).to_variant()],
+                    );
+                }
+            }
         }
     }
 }
@@ -87,13 +93,7 @@ impl WhisperCpp {
     // Public API
     // -------------------------------------------------------------------------
 
-    /// Load a whisper.cpp GGML model file.
-    ///
-    /// This is a **synchronous** call that blocks until the model is loaded.
-    /// For large models consider calling from a background thread; the signal
-    /// `model_loaded` fires on completion.
-    ///
-    /// Returns `true` on success, `false` on failure (error signal emitted).
+    /// Load a whisper.cpp GGML model file (synchronous).
     #[func]
     pub fn load_model(&mut self, path: GString) -> bool {
         let path_str = path.to_string();
@@ -113,7 +113,7 @@ impl WhisperCpp {
                 let msg = format!("Failed to load model '{path_str}': {e}");
                 godot_error!("{msg}");
                 self.base_mut()
-                    .emit_signal("transcription_error", &[GString::from(msg).to_variant()]);
+                    .emit_signal("transcription_error", &[GString::from(msg.as_str()).to_variant()]);
                 false
             }
         }
@@ -139,18 +139,8 @@ impl WhisperCpp {
         self.is_transcribing
     }
 
-    /// Transcribe raw PCM audio data.
-    ///
-    /// `audio_buffer` — raw 16-bit signed PCM samples, **mono, 16 000 Hz**,
-    /// packed as little-endian bytes (i.e. a `PackedByteArray` where every two
-    /// bytes form one i16 sample).
-    ///
-    /// Transcription runs on a **background thread**; the signal
-    /// `transcription_complete` or `transcription_error` fires on the main
-    /// thread when done.
-    ///
-    /// Returns `true` if the job was queued, `false` if already busy or no
-    /// model is loaded.
+    /// Transcribe raw PCM audio (mono 16 kHz i16 LE bytes).
+    /// Runs on a background thread; result fires via signal on next _process tick.
     #[func]
     pub fn transcribe(&mut self, audio_buffer: PackedByteArray) -> bool {
         if self.is_transcribing {
@@ -159,7 +149,7 @@ impl WhisperCpp {
         }
 
         if !self.is_model_loaded() {
-            let msg = "No model loaded — call load_model() first".to_string();
+            let msg = "No model loaded — call load_model() first";
             godot_error!("{msg}");
             self.base_mut()
                 .emit_signal("transcription_error", &[GString::from(msg).to_variant()]);
@@ -168,7 +158,6 @@ impl WhisperCpp {
 
         self.is_transcribing = true;
 
-        // Convert PackedByteArray (raw i16 LE bytes) → Vec<f32> normalised to [-1, 1]
         let bytes = audio_buffer.to_vec();
         let samples: Vec<f32> = bytes
             .chunks_exact(2)
@@ -179,47 +168,17 @@ impl WhisperCpp {
             .collect();
 
         let ctx_arc = Arc::clone(&self.context);
+        let result_arc = Arc::clone(&self.pending_result);
         let language = self.language.to_string();
         let threads = self.threads;
 
-        // Grab a Gd<Self> handle for call_deferred
-        let mut self_gd = self.base_mut().clone().cast::<WhisperCpp>();
-
         thread::spawn(move || {
-            let result = transcribe_on_thread(ctx_arc, samples, language, threads);
-            match result {
-                Ok(text) => {
-                    let text_gstring = GString::from(text);
-                    self_gd.call_deferred(
-                        "emit_signal",
-                        &[
-                            GString::from("transcription_complete").to_variant(),
-                            text_gstring.to_variant(),
-                        ],
-                    );
-                    self_gd.call_deferred("_set_transcribing_false", &[]);
-                }
-                Err(e) => {
-                    let msg = GString::from(e);
-                    self_gd.call_deferred(
-                        "emit_signal",
-                        &[
-                            GString::from("transcription_error").to_variant(),
-                            msg.to_variant(),
-                        ],
-                    );
-                    self_gd.call_deferred("_set_transcribing_false", &[]);
-                }
-            }
+            let outcome = transcribe_on_thread(ctx_arc, samples, language, threads);
+            let mut guard = result_arc.lock().unwrap();
+            *guard = Some(outcome);
         });
 
         true
-    }
-
-    /// Internal helper — resets `is_transcribing` flag on main thread.
-    #[func]
-    pub fn _set_transcribing_false(&mut self) {
-        self.is_transcribing = false;
     }
 }
 
@@ -227,9 +186,6 @@ impl WhisperCpp {
 // Internals
 // -----------------------------------------------------------------------------
 
-/// Runs whisper inference on the calling thread.
-///
-/// Designed to be called from a `thread::spawn` closure.
 fn transcribe_on_thread(
     ctx_arc: Arc<Mutex<Option<WhisperContext>>>,
     samples: Vec<f32>,
@@ -259,14 +215,14 @@ fn transcribe_on_thread(
         .full(params, &samples)
         .map_err(|e| format!("transcription failed: {e}"))?;
 
-    let num_segments = state.full_n_segments().map_err(|e| e.to_string())?;
+    let num_segments = state.full_n_segments();
     let mut result = String::new();
     for i in 0..num_segments {
-        let seg = state
-            .full_get_segment_text(i)
-            .map_err(|e| e.to_string())?;
-        result.push_str(&seg);
-        result.push(' ');
+        if let Some(seg) = state.get_segment(i) {
+            let text = seg.to_str().map_err(|e| e.to_string())?;
+            result.push_str(text);
+            result.push(' ');
+        }
     }
 
     Ok(result.trim().to_string())

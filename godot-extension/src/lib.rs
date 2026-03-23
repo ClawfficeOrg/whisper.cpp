@@ -9,13 +9,8 @@
 //! safe.
 
 use godot::prelude::*;
-use godot::classes::Node;
-use std::sync::{Arc, Mutex};
-use std::thread;
 
 mod whisper_node;
-
-use whisper_node::WhisperCpp;
 
 /// Entry-point required by Godot's GDExtension loader.
 struct WhisperCppExtension;
