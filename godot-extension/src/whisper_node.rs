@@ -24,6 +24,7 @@ use godot::classes::Node;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
+use enigo::{Enigo, Key, Keyboard, Settings};
 
 /// GDExtension Node for whisper.cpp speech recognition.
 ///
@@ -220,6 +221,101 @@ impl WhisperCpp {
     #[func]
     pub fn _set_transcribing_false(&mut self) {
         self.is_transcribing = false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Input Simulation (cross-platform via enigo)
+    // -------------------------------------------------------------------------
+
+    /// Type text using the system keyboard input simulation.
+    ///
+    /// Works on Linux, macOS, and Windows via the `enigo` crate.
+    /// Returns `true` on success, `false` on failure.
+    #[func]
+    pub fn type_text(&mut self, text: GString) -> bool {
+        let text_str = text.to_string();
+        if text_str.is_empty() {
+            return false;
+        }
+
+        match Enigo::new(&Settings::default()) {
+            Ok(mut enigo) => {
+                godot_print!("[WhisperCpp] typing: {text_str}");
+                enigo.text(&text_str).unwrap_or_else(|e| {
+                    godot_error!("[WhisperCpp] type_text error: {e}");
+                });
+                true
+            }
+            Err(e) => {
+                godot_error!("[WhisperCpp] failed to create Enigo: {e}");
+                false
+            }
+        }
+    }
+
+    /// Press a key by name (e.g., "Return", "Escape", "Tab", "a", "F1").
+    ///
+    /// Uses enigo's cross-platform key mapping. Returns `true` on success.
+    #[func]
+    pub fn press_key(&mut self, key_name: GString) -> bool {
+        let key_str = key_name.to_string();
+        if key_str.is_empty() {
+            return false;
+        }
+
+        match Enigo::new(&Settings::default()) {
+            Ok(mut enigo) => {
+                // Map common key names to enigo Key enum
+                let key = match key_str.to_lowercase().as_str() {
+                    "return" | "enter" => Key::Return,
+                    "escape" | "esc" => Key::Escape,
+                    "tab" => Key::Tab,
+                    "space" => Key::Space,
+                    "backspace" | "back" => Key::Backspace,
+                    "delete" | "del" => Key::Delete,
+                    "insert" => Key::Insert,
+                    "home" => Key::Home,
+                    "end" => Key::End,
+                    "pageup" | "page_up" => Key::PageUp,
+                    "pagedown" | "page_down" => Key::PageDown,
+                    "up" => Key::UpArrow,
+                    "down" => Key::DownArrow,
+                    "left" => Key::LeftArrow,
+                    "right" => Key::RightArrow,
+                    "f1" => Key::F1,
+                    "f2" => Key::F2,
+                    "f3" => Key::F3,
+                    "f4" => Key::F4,
+                    "f5" => Key::F5,
+                    "f6" => Key::F6,
+                    "f7" => Key::F7,
+                    "f8" => Key::F8,
+                    "f9" => Key::F9,
+                    "f10" => Key::F10,
+                    "f11" => Key::F11,
+                    "f12" => Key::F12,
+                    s if s.len() == 1 => {
+                        // Single character - try as layout key
+                        let c = s.chars().next().unwrap();
+                        Key::Unicode(c)
+                    }
+                    _ => {
+                        godot_warn!("[WhisperCpp] unknown key: {key_str}");
+                        return false;
+                    }
+                };
+
+                godot_print!("[WhisperCpp] pressing key: {key_str}");
+                enigo.key(key, enigo::Direction::Click).unwrap_or_else(|e| {
+                    godot_error!("[WhisperCpp] press_key error: {e}");
+                });
+                true
+            }
+            Err(e) => {
+                godot_error!("[WhisperCpp] failed to create Enigo: {e}");
+                false
+            }
+        }
     }
 }
 
