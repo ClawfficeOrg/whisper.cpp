@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 godot = "0.4"
 whisper-rs = "0.16"
-enigo = "0.3"
+enigo = { version = "0.3", default-features = false, features = ["x11rb"] }
 
 [profile.release]
 opt-level = 3

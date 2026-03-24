@@ -20,11 +20,18 @@
 //! ```
 
 use godot::prelude::*;
-use godot::classes::Node;
+use godot::classes::{INode, Node};
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
 use enigo::{Enigo, Key, Keyboard, Settings};
+
+/// Result sent from background transcription thread to main thread.
+enum TranscribeResult {
+    Ok(String),
+    Err(String),
+}
 
 /// GDExtension Node for whisper.cpp speech recognition.
 ///
@@ -54,6 +61,9 @@ pub struct WhisperCpp {
     /// Number of CPU threads to use for inference.
     #[var]
     pub threads: i32,
+
+    /// Channel receiver for transcription results from background thread.
+    result_rx: Option<Receiver<TranscribeResult>>,
 }
 
 #[godot_api]
@@ -66,6 +76,40 @@ impl INode for WhisperCpp {
             is_transcribing: false,
             language: GString::from("en"),
             threads: 4,
+            result_rx: None,
+        }
+    }
+
+    fn process(&mut self, _delta: f64) {
+        // Poll the result channel on the main thread
+        if let Some(rx) = &self.result_rx {
+            match rx.try_recv() {
+                Ok(TranscribeResult::Ok(text)) => {
+                    self.is_transcribing = false;
+                    self.result_rx = None;
+                    let text_gs = GString::from(text.as_str());
+                    self.base_mut()
+                        .emit_signal("transcription_complete", &[text_gs.to_variant()]);
+                }
+                Ok(TranscribeResult::Err(msg)) => {
+                    self.is_transcribing = false;
+                    self.result_rx = None;
+                    let msg_gs = GString::from(msg.as_str());
+                    self.base_mut()
+                        .emit_signal("transcription_error", &[msg_gs.to_variant()]);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Not done yet — keep waiting
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Thread died without sending a result
+                    self.is_transcribing = false;
+                    self.result_rx = None;
+                    let msg = GString::from("transcription thread disconnected unexpectedly");
+                    self.base_mut()
+                        .emit_signal("transcription_error", &[msg.to_variant()]);
+                }
+            }
         }
     }
 }
@@ -114,7 +158,7 @@ impl WhisperCpp {
                 let msg = format!("Failed to load model '{path_str}': {e}");
                 godot_error!("{msg}");
                 self.base_mut()
-                    .emit_signal("transcription_error", &[GString::from(msg).to_variant()]);
+                    .emit_signal("transcription_error", &[GString::from(msg.as_str()).to_variant()]);
                 false
             }
         }
@@ -160,7 +204,7 @@ impl WhisperCpp {
         }
 
         if !self.is_model_loaded() {
-            let msg = "No model loaded — call load_model() first".to_string();
+            let msg = "No model loaded — call load_model() first";
             godot_error!("{msg}");
             self.base_mut()
                 .emit_signal("transcription_error", &[GString::from(msg).to_variant()]);
@@ -183,44 +227,18 @@ impl WhisperCpp {
         let language = self.language.to_string();
         let threads = self.threads;
 
-        // Grab a Gd<Self> handle for call_deferred
-        let mut self_gd = self.base_mut().clone().cast::<WhisperCpp>();
+        let (tx, rx): (Sender<TranscribeResult>, Receiver<TranscribeResult>) = mpsc::channel();
+        self.result_rx = Some(rx);
 
         thread::spawn(move || {
             let result = transcribe_on_thread(ctx_arc, samples, language, threads);
             match result {
-                Ok(text) => {
-                    let text_gstring = GString::from(text);
-                    self_gd.call_deferred(
-                        "emit_signal",
-                        &[
-                            GString::from("transcription_complete").to_variant(),
-                            text_gstring.to_variant(),
-                        ],
-                    );
-                    self_gd.call_deferred("_set_transcribing_false", &[]);
-                }
-                Err(e) => {
-                    let msg = GString::from(e);
-                    self_gd.call_deferred(
-                        "emit_signal",
-                        &[
-                            GString::from("transcription_error").to_variant(),
-                            msg.to_variant(),
-                        ],
-                    );
-                    self_gd.call_deferred("_set_transcribing_false", &[]);
-                }
+                Ok(text) => { let _ = tx.send(TranscribeResult::Ok(text)); }
+                Err(e) => { let _ = tx.send(TranscribeResult::Err(e)); }
             }
         });
 
         true
-    }
-
-    /// Internal helper — resets `is_transcribing` flag on main thread.
-    #[func]
-    pub fn _set_transcribing_false(&mut self) {
-        self.is_transcribing = false;
     }
 
     // -------------------------------------------------------------------------
@@ -295,7 +313,6 @@ impl WhisperCpp {
                     "f11" => Key::F11,
                     "f12" => Key::F12,
                     s if s.len() == 1 => {
-                        // Single character - try as layout key
                         let c = s.chars().next().unwrap();
                         Key::Unicode(c)
                     }
@@ -355,14 +372,14 @@ fn transcribe_on_thread(
         .full(params, &samples)
         .map_err(|e| format!("transcription failed: {e}"))?;
 
-    let num_segments = state.full_n_segments().map_err(|e| e.to_string())?;
+    let num_segments = state.full_n_segments();
     let mut result = String::new();
     for i in 0..num_segments {
-        let seg = state
-            .full_get_segment_text(i)
-            .map_err(|e| e.to_string())?;
-        result.push_str(&seg);
-        result.push(' ');
+        if let Some(seg) = state.get_segment(i) {
+            let text = seg.to_str().map_err(|e| e.to_string())?;
+            result.push_str(text);
+            result.push(' ');
+        }
     }
 
     Ok(result.trim().to_string())
