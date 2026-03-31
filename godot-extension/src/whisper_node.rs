@@ -64,6 +64,9 @@ pub struct WhisperCpp {
 
     /// Channel receiver for transcription results from background thread.
     result_rx: Option<Receiver<TranscribeResult>>,
+
+    /// Channel receiver for model load results from background thread.
+    model_load_rx: Option<Receiver<Result<String, String>>>,
 }
 
 #[godot_api]
@@ -77,6 +80,7 @@ impl INode for WhisperCpp {
             language: GString::from("en"),
             threads: 4,
             result_rx: None,
+            model_load_rx: None,
         }
     }
 
