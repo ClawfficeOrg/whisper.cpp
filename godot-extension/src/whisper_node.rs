@@ -145,27 +145,35 @@ impl WhisperCpp {
     /// Returns `true` on success, `false` on failure (error signal emitted).
     #[func]
     pub fn load_model(&mut self, path: GString) -> bool {
+        // Non-blocking model load: spawn a background thread to perform
+        // heavy model initialization and send the result back to the main
+        // thread via a channel polled in process(). This avoids accessing
+        // Godot bindings from background threads (which is UB).
         let path_str = path.to_string();
-        godot_print!("[WhisperCpp] loading model: {path_str}");
+        godot_print!("[WhisperCpp] starting background model load: {path_str}");
 
-        match WhisperContext::new_with_params(&path_str, WhisperContextParameters::default()) {
-            Ok(ctx) => {
-                let mut guard = self.context.lock().unwrap();
-                *guard = Some(ctx);
-                drop(guard);
-                godot_print!("[WhisperCpp] model loaded ok");
-                self.base_mut()
-                    .emit_signal("model_loaded", &[path.to_variant()]);
-                true
+        let (tx, rx): (Sender<Result<String, String>>, Receiver<Result<String, String>>) = mpsc::channel();
+        self.model_load_rx = Some(rx);
+
+        let ctx_arc = Arc::clone(&self.context);
+        thread::spawn(move || {
+            match WhisperContext::new_with_params(&path_str, WhisperContextParameters::default()) {
+                Ok(ctx) => {
+                    // Store context under mutex
+                    {
+                        let mut guard = ctx_arc.lock().unwrap();
+                        *guard = Some(ctx);
+                    }
+                    let _ = tx.send(Ok(path_str.clone()));
+                }
+                Err(e) => {
+                    let err = format!("Failed to load model '{path_str}': {e}");
+                    let _ = tx.send(Err(err));
+                }
             }
-            Err(e) => {
-                let msg = format!("Failed to load model '{path_str}': {e}");
-                godot_error!("{msg}");
-                self.base_mut()
-                    .emit_signal("transcription_error", &[GString::from(msg.as_str()).to_variant()]);
-                false
-            }
-        }
+        });
+
+        true
     }
 
     /// Unload the currently loaded model and free its memory.
